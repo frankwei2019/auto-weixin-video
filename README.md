@@ -119,12 +119,36 @@ await wrapper_loc.click(force=True)
 ### `networkidle` 永远等不到
 视频号页面一直有心跳包，必须用 `wait_until="domcontentloaded"` + 手动等 iframe 出现。
 
+### 定时发布（2026-07-31 重写）
+之前定时控件都用 `page` 找，但 picker / radio / 时间 input 实际**在 iframe `micro/content/post/create` 里**。新方案：
+
+```python
+target = next((f for f in page.frames if "micro/content/post/create" in f.url), page)
+```
+
+6 步全用 JS evaluate（避开 Playwright stale locator）：
+
+1. 切到"定时"radio（label 文字是"定时"，不是"定时发布"）— React setter 强制改 `checked` + dispatch `click`/`change`
+2. JS `focus() + click()` 触发日期 picker（Playwright 真点击会超时）
+3. 切月份：`.weui-desktop-picker__panel__hd .weui-desktop-btn__icon__right`（不是 `.weui-desktop-picker__next`）
+4. 点日期：`.weui-desktop-picker__table a` 里找精确文字（不是 `weui-desktop-picker__disabled`）
+5. 改时间：React setter 改 `input[placeholder="请选择时间"]` 的 value（**全局找**，不在 picker 容器下）+ 触发 `input`/`change`/`blur`
+6. 验证：读 `input[placeholder="请选择发表时间"]` 的最终 value
+
+月份切换后 React 会重渲染，Playwright `target.locator(...)` 引用会失效，必须用 `target.evaluate("() => document.querySelector(...)")` 重新查。
+
+批量调度时跳过未来时间过滤：
+```bash
+python scripts/batch_publish.py --ignore-time --max-count 5
+```
+
 ## 已知坑
 
 1. **系统重启后需要重新扫码** — browser_data 不一定能跨重启续期
 2. **视频号 UI 选择器经常变** — UI 改版后 selector 可能失效，需要更新
 3. **`page.pause()` 不靠谱** — 远程桌面下 Playwright Inspector 窗口可能被挡住，扫码后忘了点 Resume 就卡死
 4. **登录 cookie 1-2 周失效** — 失效后重新跑 `get_cookie.py`
+5. **月份切换按钮 class 经常被混淆** — `weui-desktop-picker__next` 是错的，正确的是 `.weui-desktop-picker__panel__hd .weui-desktop-btn__icon__right`
 
 ## License
 

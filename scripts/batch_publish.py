@@ -150,6 +150,7 @@ def main():
     parser.add_argument("--skip-publish", action="store_true", help="跑完所有步骤但不点发表（保留页面供检查）")
     parser.add_argument("--keep-browser", type=int, default=0, metavar="SEC", help="跑完后保留浏览器 N 秒（默认 0=立即关）")
     parser.add_argument("--manual-finish", action="store_true", help="半自动模式：跑完自动部分后保留浏览器，老K手动勾原创/AI/发表")
+    parser.add_argument("--ignore-time", action="store_true", help="忽略定时时间过滤（提前上传+设定时发布，常和 pending 重发一起用）")
     parser.add_argument("--max-count", type=int, default=0, metavar="N", help="最多发布 N 条（0=不限制）")
     args = parser.parse_args()
 
@@ -166,8 +167,8 @@ def main():
         if args.file and r["video_file"] != args.file:
             continue
         # 如果有定时发布且未到时间，跳过
-        # manual-finish 模式忽略时间过滤（提前上传+设定时发布）
-        if not args.manual_finish:
+        # manual-finish / --ignore-time 模式忽略时间过滤（提前上传+设定时发布）
+        if not (args.manual_finish or args.ignore_time):
             sched = parse_scheduled_at(r.get("scheduled_at", ""))
             if sched and sched > now and not args.file:
                 print(f"  ⏳ {r['video_file']} 定时 {sched} 未到，跳过")

@@ -835,33 +835,227 @@ class WeixinVideoUploader:
         raise TimeoutError("视频上传超时")
 
     async def _set_schedule_time(self, page: Page):
-        try:
-            label_element = page.locator("label").filter(has_text="定时").nth(1)
-            await label_element.click()
-        except Exception:
-            try:
-                await page.locator('text=定时发布').first.click()
-            except Exception:
-                return
+        """设置定时发布时间。视频号默认是明天 21:00，必须改成 schedule_time 指定的日期+小时+分钟。
 
-        await asyncio.sleep(0.5)
+        关键发现（2026-07-31）：
+        - 定时控件（"定时发布"radio、日期 picker、时间 input）**在 iframe 里**，必须用 target (frame)
+        - 原代码用 page 找不到 picker，cnt=42 是 main frame 的无关链接
+        - 必须：选月份 → 点日期 → 输入完整 HH:MM
+        """
+        if not self.schedule_time:
+            return
+
+        # 切到 iframe（定时控件在 micro/content/post/create 里）
+        frame = None
+        for f in page.frames:
+            if "micro/content/post/create" in f.url:
+                frame = f
+                break
+        target = frame if frame else page
+
+        target_day = self.schedule_time.day
+        target_hour = self.schedule_time.hour
+        target_minute = self.schedule_time.minute
+        target_month = self.schedule_time.month
+
+        print(f"   定时目标: {self.schedule_time.strftime('%Y-%m-%d %H:%M')} (iframe: {'✅' if frame else '❌'})")
+
         try:
-            await page.click('input[placeholder="请选择发表时间"]')
-            elements = await page.query_selector_all('table.weui-desktop-picker__table a')
-            for element in elements:
-                cls = await element.evaluate('el => el.className')
-                if 'weui-desktop-picker__disabled' in cls:
-                    continue
-                text = await element.inner_text()
-                if text.strip() == str(self.schedule_time.day):
-                    await element.click()
-                    break
-            await page.click('input[placeholder="请选择时间"]')
-            await page.keyboard.press("Control+KeyA")
-            await page.keyboard.type(str(self.schedule_time.hour))
-            await page.locator("div.input-editor").click()
+            # 1) 切到"定时" radio（视频号的 radio 文字是"定时"，不是"定时发布"）
+            clicked_radio = False
+
+            # 先 dump 一下 target 里 radio 实际数量
+            radio_count = await target.locator('input[type="radio"]').count()
+            print(f"   🔍 target 内 radio 总数: {radio_count}")
+
+            # 方法 1：找精确 label "定时"（不是"不定时"），Playwright 真点击（React 会响应）
+            try:
+                # 用 xpath 找包含精确文字"定时"的 span（在 weui-desktop-form__check-content 里）
+                spans = target.locator('span.weui-desktop-form__check-content')
+                sp_cnt = await spans.count()
+                print(f"   🔍 check-content span 数: {sp_cnt}")
+                for i in range(sp_cnt):
+                    s = spans.nth(i)
+                    txt = (await s.inner_text()).strip()
+                    if txt == '定时':
+                        await s.click(force=True, timeout=3000)
+                        clicked_radio = True
+                        print(f"   ✅ 切到定时模式（Playwright 点 span='定时'）")
+                        break
+            except Exception as e:
+                print(f"   span click 失败: {e}")
+
+            # 方法 2：用 React 内部机制改 checked 属性 + 触发 change 事件
+            if not clicked_radio:
+                try:
+                    result = await target.evaluate("""
+                    () => {
+                        const radios = document.querySelectorAll('input[type="radio"]');
+                        for (const r of radios) {
+                            if (r.value === '1') {
+                                // 1) 设置 checked
+                                const setter = Object.getOwnPropertyDescriptor(
+                                    window.HTMLInputElement.prototype, 'checked'
+                                ).set;
+                                setter.call(r, true);
+                                // 2) 触发 change 事件让 React 知道
+                                r.dispatchEvent(new Event('click', {bubbles: true}));
+                                r.dispatchEvent(new Event('change', {bubbles: true}));
+                                return {clicked: true, now_checked: r.checked};
+                            }
+                        }
+                        return {clicked: false};
+                    }
+                    """)
+                    if result.get('clicked'):
+                        clicked_radio = True
+                        print(f"   ✅ 切到定时模式（React setter, now_checked={result.get('now_checked')}）")
+                except Exception as e:
+                    print(f"   React setter 失败: {e}")
+
+            if not clicked_radio:
+                print("   ⚠️  未找到定时 radio")
+                return
+            await asyncio.sleep(2.0)  # 等 React 重新渲染 date/time input
+
+            # 验证：再次 dump radios 确认切换成功
+            new_state = await target.evaluate("""
+            () => {
+                const radios = document.querySelectorAll('input[type="radio"]');
+                const state = [];
+                for (const r of radios) {
+                    state.push({value: r.value, checked: r.checked});
+                }
+                return state;
+            }
+            """)
+            import json as _json
+            print(f"   🔍 切换后 radio 状态: {_json.dumps(new_state, ensure_ascii=False)}")
+
+            # 2) 用 JS click 触发 picker（Playwright click 也会超时，但 JS click 能弹 picker）
+            try:
+                await target.evaluate("""
+                () => {
+                    const inp = document.querySelector('input[placeholder="请选择发表时间"]');
+                    if (inp) {
+                        inp.focus();
+                        inp.click();
+                    }
+                }
+                """)
+                print("   ✅ 已触发日期 picker")
+            except Exception as e:
+                print(f"   ⚠️  触发 picker 失败: {e}")
+                return
+            await asyncio.sleep(1.5)
+
+            # 3) 切换月份（如果日历当前显示的不是目标月）
+            try:
+                header_text = await target.evaluate("""
+                () => {
+                    const headers = document.querySelectorAll('.weui-desktop-picker__panel__hd');
+                    for (const h of headers) {
+                        const t = (h.innerText || '').trim();
+                        if (t.includes('月')) return t;
+                    }
+                    return '';
+                }
+                """)
+                import re as _re
+                m = _re.search(r'(\d+)月', header_text)
+                current_month = int(m.group(1)) if m else None
+                print(f"   日历当前月份: {current_month} (header={header_text[:30]})")
+
+                if current_month and current_month != target_month:
+                    # 月份右箭头按钮：用 JS click（更稳定）
+                    clicks_needed = (target_month - current_month) % 12
+                    for click_i in range(clicks_needed):
+                        try:
+                            await target.evaluate(f"""
+                            () => {{
+                                const right = document.querySelector('.weui-desktop-picker__panel__hd .weui-desktop-btn__icon__right');
+                                if (right) right.click();
+                            }}
+                            """)
+                            await asyncio.sleep(0.6)
+                        except Exception as e:
+                            print(f"   月份 click {click_i+1} 失败: {e}")
+                            break
+                    # 验证
+                    new_hd = await target.evaluate("""
+                    () => {
+                        const h = document.querySelector('.weui-desktop-picker__panel__hd');
+                        return h ? h.innerText : '';
+                    }
+                    """)
+                    print(f"   切换到目标月（{target_month}）后头部: {new_hd}")
+            except Exception as e:
+                print(f"   月份切换跳过: {e}")
+
+            await asyncio.sleep(0.5)
+
+            # 4) 直接用 JS 点目标日期（绕过 stale locator 问题）
+            day_clicked = await target.evaluate(f"""
+            () => {{
+                const links = document.querySelectorAll('.weui-desktop-picker__table a');
+                const targetDay = "{target_day}";
+                for (const a of links) {{
+                    const txt = a.innerText.trim();
+                    const cls = a.className || '';
+                    if (txt === targetDay && !cls.includes('disabled')) {{
+                        a.click();
+                        return {{clicked: true, text: txt}};
+                    }}
+                }}
+                return {{clicked: false, total: links.length}};
+            }}
+            """)
+            if day_clicked.get('clicked'):
+                print(f"   ✅ 已选日期: {day_clicked.get('text')}")
+            else:
+                print(f"   ⚠️  未找到日期 {target_day}（{day_clicked}）")
+
+            await asyncio.sleep(1)
+
+            # 5) 用 React setter 改时间（placeholder="请选择时间"）
+            time_str = f"{target_hour:02d}:{target_minute:02d}"
+            try:
+                time_result = await target.evaluate(f"""
+                () => {{
+                    const inp = document.querySelector('input[placeholder="请选择时间"]');
+                    if (!inp) return {{set: false, reason: 'not found'}};
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(inp, '{time_str}');
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                    return {{set: true, newVal: inp.value}};
+                }}
+                """)
+                if time_result.get('set'):
+                    print(f"   ✅ 已填时间: {time_result.get('newVal')}")
+                else:
+                    print(f"   ⚠️  未找到时间 input")
+            except Exception as e:
+                print(f"   ⚠️  填时间失败: {e}")
+
+            await asyncio.sleep(1)
+
+            # 6) 验证最终定时
+            actual = await target.evaluate("""
+                () => {
+                    const inputs = document.querySelectorAll('input[placeholder="请选择发表时间"]');
+                    for (const inp of inputs) {
+                        const v = inp.value;
+                        if (v && v.includes('-')) return v;
+                    }
+                    return '';
+                }
+            """)
+            print(f"   🔍 视频号显示的定时: {actual}")
+
         except Exception as e:
-            print(f"   定时设置失败: {e}")
+            print(f"   ❌ 定时设置失败: {e}")
 
     async def _add_short_title(self, page: Page):
         try:
