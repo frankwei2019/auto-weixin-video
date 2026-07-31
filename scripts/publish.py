@@ -1,0 +1,1025 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""微信视频号视频发布脚本（拷贝自 auto-weixin-video skill）"""
+
+import argparse
+import asyncio
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+try:
+    from playwright.async_api import async_playwright, Page
+except ImportError:
+    print("错误：未安装 playwright")
+    print("请运行：pip install playwright && playwright install chromium")
+    sys.exit(1)
+
+
+COOKIE_DIR = Path(__file__).parent.parent / "cookies"
+COOKIE_FILE = COOKIE_DIR / "weixin_video.json"
+
+
+class WeixinVideoUploader:
+    def __init__(
+        self,
+        video_path: str,
+        title: str,
+        tags: List[str] = None,
+        original: bool = False,
+        category: str = None,
+        schedule_time: datetime = None,
+        is_draft: bool = False,
+        headless: bool = False,
+        cover_path: Optional[str] = None,
+        mark_ai: bool = False,
+        skip_publish: bool = False,
+        keep_browser: int = 0,
+        manual_finish: bool = False,
+    ):
+        self.video_path = Path(video_path)
+        self.title = title
+        self.tags = tags or []
+        self.original = original
+        self.category = category
+        self.schedule_time = schedule_time
+        self.is_draft = is_draft
+        self.headless = headless
+        self.cover_path = Path(cover_path) if cover_path else None
+        self.mark_ai = mark_ai
+        self.skip_publish = skip_publish
+        self.keep_browser = keep_browser
+        self.manual_finish = manual_finish  # 半自动模式：跑完自动部分后老K手动勾原创/AI/发表
+
+        if not self.video_path.exists():
+            raise FileNotFoundError(f"视频文件不存在: {self.video_path}")
+        if self.cover_path and not self.cover_path.exists():
+            raise FileNotFoundError(f"封面文件不存在: {self.cover_path}")
+
+    async def upload(self) -> bool:
+        print("=" * 60)
+        print("微信视频号发布")
+        print("=" * 60)
+        print(f"视频: {self.video_path}")
+        print(f"标题: {self.title}")
+        print(f"话题: {', '.join(self.tags) if self.tags else '无'}")
+        print(f"原创: {'是' if self.original else '否'}")
+        print(f"封面: {self.cover_path if self.cover_path else '自动截取'}")
+        print(f"AI标注: {'是' if self.mark_ai else '否'}")
+        print(f"定时: {self.schedule_time.strftime('%Y-%m-%d %H:%M') if self.schedule_time else '立即发布'}")
+        print(f"模式: {'草稿' if self.is_draft else ('跳过发布' if self.skip_publish else '正式发布')}")
+        print()
+
+        if not COOKIE_FILE.exists():
+            print("❌ Cookie 文件不存在，请先运行 get_cookie.py")
+            return False
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=self.headless)
+            try:
+                context = await browser.new_context(storage_state=str(COOKIE_FILE))
+                page = await context.new_page()
+
+                print("[1/7] 打开视频号创作者中心...")
+                await page.goto(
+                    "https://channels.weixin.qq.com/platform/post/create",
+                    timeout=60000,
+                    wait_until="domcontentloaded",
+                )
+                # 等 2 秒让页面做可能的客户端跳转
+                await asyncio.sleep(2)
+                # 检查是否被重定向到登录页
+                if "login" in page.url or "passport" in page.url:
+                    print("❌ Cookie 已过期，被重定向到登录页！")
+                    print(f"   当前 URL: {page.url}")
+                    print("   请重新运行 get_cookie.py 获取 cookie")
+                    logs_dir = Path(__file__).parent.parent / "logs"
+                    logs_dir.mkdir(exist_ok=True)
+                    await page.screenshot(path=str(logs_dir / "login-redirect.png"))
+                    return False
+                # 等 iframe 出现（视频号发布页是 iframe 嵌入）
+                iframe = None
+                for _ in range(30):
+                    for f in page.frames:
+                        if "micro/content/post/create" in f.url:
+                            iframe = f
+                            break
+                    if iframe:
+                        break
+                    await asyncio.sleep(1)
+                if not iframe:
+                    print("   ⚠️  未找到发布 iframe，尝试在主页面操作")
+                else:
+                    # 等 iframe 内容加载完
+                    try:
+                        await iframe.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                print(f"   页面已加载（iframe: {'✅' if iframe else '❌'}）, URL: {page.url}")
+
+                print("[2/7] 上传视频文件...")
+                # file input 可能在主页面或 iframe 里，两边都试
+                uploaded = False
+                for retry in range(3):
+                    try:
+                        # 先试 iframe（如果有），再试主页面
+                        search_targets = []
+                        if iframe:
+                            search_targets.append(("iframe", iframe))
+                        search_targets.append(("page", page))
+
+                        for label, tgt in search_targets:
+                            try:
+                                file_input = tgt.locator('input[type="file"]')
+                                if await file_input.count() > 0:
+                                    await file_input.first.set_input_files(str(self.video_path), timeout=30000)
+                                    uploaded = True
+                                    print(f"   ✅ 视频上传成功（在 {label} 中找到 file input）")
+                                    break
+                            except Exception:
+                                continue
+
+                        if not uploaded:
+                            raise Exception("所有位置都未找到 file input")
+                        break
+                    except Exception as e:
+                        print(f"   视频上传 retry {retry+1}/3: {e}")
+                        if retry < 2:
+                            await asyncio.sleep(3)
+                            # 重新找 iframe
+                            for f in page.frames:
+                                if "micro/content/post/create" in f.url:
+                                    iframe = f
+                                    break
+                        else:
+                            raise
+
+                print("[3/7] 填写标题和话题...")
+                await self._fill_title_and_tags(page)
+
+                print("[4/7] 检查合集...")
+                await self._add_to_collection(page)
+
+                if self.manual_finish:
+                    print("=" * 60)
+                    print("⏸️  半自动模式：跑完自动部分")
+                    print("=" * 60)
+                    print("已自动完成：")
+                    print("  ✅ 视频上传")
+                    print("  ✅ 标题+话题")
+                    print("  ✅ 合集检查")
+                    print()
+                    print("请手动完成以下步骤：")
+                    print("  1️⃣  等待视频上传完成（看下方的进度条消失）")
+                    print("  2️⃣  封面预览 → 编辑 → 上传封面 cover-05.jpg（如果没自动上）")
+                    print("  3️⃣  勾选'声明原创' → 弹窗选原创类型 → 点确认")
+                    print("  4️⃣  展开'视频标注' → 勾选'含 AI 生成内容'")
+                    print("  5️⃣  短标题（已自动填）")
+                    print("  6️⃣  点'发表'")
+                    print("=" * 60)
+                    # 跳到发布前的状态：等视频上传完 + 自动填短标题 + 自动选定时 + 自动上传封面
+                    await self._wait_for_upload_complete(page)
+                    if self.schedule_time:
+                        await self._set_schedule_time(page)
+                    await self._add_short_title(page)
+                    await self._upload_cover(page)
+                    # 截个图让老K看现状
+                    logs_dir = Path(__file__).parent.parent / "logs"
+                    logs_dir.mkdir(exist_ok=True)
+                    shot = logs_dir / f"manual-finish-{datetime.now():%Y%m%d%H%M%S}.png"
+                    await page.screenshot(path=str(shot), full_page=True)
+                    print(f"\n📸 当前状态截图：{shot.name}")
+                    print(f"⏸️  浏览器保留 {self.keep_browser} 秒，老K手动操作...")
+                    # 先存 cookie（浏览器关了就存不了）
+                    await context.storage_state(path=str(COOKIE_FILE))
+                    await self._maybe_keep_browser(browser, page)
+                    return True
+
+                print("[5/7] 声明原创...")
+                await self._declare_original(page)
+
+                print("[6/9] 标注含 AI 内容...")
+                await self._mark_ai_content(page)
+
+                print("[7/9] 等待视频上传完成...")
+                await self._wait_for_upload_complete(page)
+
+                print("[8/9] 上传自定义封面...")
+                await self._upload_cover(page)
+
+                print("[9/9] 发布...")
+                if self.schedule_time:
+                    await self._set_schedule_time(page)
+
+                await self._add_short_title(page)
+                await self._publish(page)
+
+                await context.storage_state(path=str(COOKIE_FILE))
+
+                print()
+                print("=" * 60)
+                print("✅ 视频发布成功！")
+                print("=" * 60)
+
+                await self._maybe_keep_browser(browser, page)
+                return True
+
+            except Exception as e:
+                print(f"❌ 发布失败: {e}")
+                import traceback
+                traceback.print_exc()
+                await self._maybe_keep_browser(browser, page)
+                return False
+
+    async def _maybe_keep_browser(self, browser, page=None):
+        """跑完后保留浏览器，让老K 可手动操作"""
+        if self.keep_browser <= 0 and not self.manual_finish:
+            await browser.close()
+            return
+        print()
+        if self.manual_finish:
+            # manual-finish 模式：检测老K点发表后页面跳转，或等固定时间
+            timeout = self.keep_browser if self.keep_browser > 0 else 600
+            print("=" * 60)
+            print("⏸️  浏览器已保留，老K手动操作：")
+            print("   1. 勾「声明原创」→ 弹窗里选类型 → 确认")
+            print("   2. 展开「视频标注」→ 勾「含AI生成内容」")
+            print("   3. 确认封面、定时发布时间")
+            print("   4. 点「发表」")
+            print("=" * 60)
+            print(f"   最多等 {timeout} 秒，发表成功后自动继续下一个...")
+            # 轮询检测：页面跳转到 post/list 说明发表成功
+            deadline = asyncio.get_event_loop().time() + timeout
+            published = False
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    if page and ("post/list" in page.url or "post/manage" in page.url):
+                        published = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+            if published:
+                print("✅ 检测到发表成功（页面已跳转），继续下一个...")
+            else:
+                print(f"⏰ 等待超时（{timeout}秒），继续下一个...")
+        else:
+            print(f"⏸️  保留浏览器 {self.keep_browser} 秒，老K 可以手动查看页面...")
+            print(f"   按 Ctrl+C 立即关闭")
+            try:
+                await asyncio.sleep(self.keep_browser)
+            except asyncio.CancelledError:
+                pass
+        await browser.close()
+
+    async def _fill_title_and_tags(self, page: Page):
+        """关键修复：标题+话题一起填到 div.input-editor（视频号统一富文本编辑器）"""
+        await page.locator("div.input-editor").first.click()
+        await page.keyboard.type(self.title)
+        await page.keyboard.press("Enter")
+
+        for tag in self.tags:
+            await page.keyboard.type("#" + tag)
+            await page.keyboard.press("Space")
+            await asyncio.sleep(0.3)
+
+        if self.tags:
+            print(f"   已添加 {len(self.tags)} 个话题")
+
+    async def _add_to_collection(self, page: Page):
+        try:
+            collection_elements = page.get_by_text("添加到合集").locator("xpath=following-sibling::div").locator(
+                '.option-list-wrap > div')
+            if await collection_elements.count() > 1:
+                await page.get_by_text("添加到合集").locator("xpath=following-sibling::div").click()
+                await collection_elements.first.click()
+                print("   已添加到合集")
+        except Exception:
+            print("   无可用合集")
+
+    async def _declare_original(self, page: Page):
+        """勾选声明原创 + 处理原创权益 modal。
+
+        视频号用 Ant Design checkbox：每个 checkbox 是 <label class="ant-checkbox-wrapper">
+        包含 <span class="ant-checkbox"> > <input class="ant-checkbox-input">。
+        定位策略：找含"声明原创"文字的 label 父节点，再点它的 checkbox-input。
+        """
+        logs_dir = Path(__file__).parent.parent / "logs"
+        logs_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        try:
+            frame = None
+            for f in page.frames:
+                if "micro/content/post/create" in f.url:
+                    frame = f
+                    break
+            target = frame if frame else page
+
+            # 1) 探测当前"声明原创" checkbox 状态
+            #    通过 class 中是否有 "ant-checkbox-checked" 判断
+            state = await target.evaluate(
+                """
+                () => {
+                    const labels = document.querySelectorAll('.label.with-tip-label, .label');
+                    for (const lbl of labels) {
+                        if ((lbl.innerText || '').trim() === '声明原创') {
+                            const formItem = lbl.closest('.form-item');
+                            if (formItem) {
+                                const wrapper = formItem.querySelector('.ant-checkbox-wrapper');
+                                const cb = formItem.querySelector('.ant-checkbox-input');
+                                if (wrapper) {
+                                    const checked = wrapper.className.includes('ant-checkbox-wrapper-checked')
+                                        || (cb && cb.checked);
+                                    return {found: true, checked: checked};
+                                }
+                            }
+                        }
+                    }
+                    return {found: false};
+                }
+                """
+            )
+            print(f"   🔍 原创声明初始: {state}")
+
+            # 2) 如果未勾选，点 checkbox
+            if not state.get("checked"):
+                clicked = await target.evaluate(
+                    """
+                    () => {
+                        const labels = document.querySelectorAll('.label.with-tip-label, .label');
+                        for (const lbl of labels) {
+                            if ((lbl.innerText || '').trim() === '声明原创') {
+                                const formItem = lbl.closest('.form-item');
+                                if (formItem) {
+                                    const cb = formItem.querySelector('.ant-checkbox-input');
+                                    if (cb) {
+                                        cb.click();
+                                        return true;
+                                    }
+                                    // 兜底：直接点 .ant-checkbox-wrapper
+                                    const wrapper = formItem.querySelector('.ant-checkbox-wrapper');
+                                    if (wrapper) {
+                                        wrapper.click();
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                    """
+                )
+                if clicked:
+                    print("   ✅ JS 已点 checkbox")
+                else:
+                    print("   ⚠️  JS 点击失败")
+
+                # 用 Playwright 真点击 wrapper（React 受控组件对真实鼠标事件响应更好）
+                try:
+                    wrapper_loc = target.locator(
+                        "xpath=//div[contains(@class,'form-item') and .//*[text()='声明原创']]//label[contains(@class,'ant-checkbox-wrapper')]"
+                    ).first
+                    if await wrapper_loc.count() > 0:
+                        await wrapper_loc.scroll_into_view_if_needed(timeout=3000)
+                        await wrapper_loc.click(force=True, timeout=3000)
+                        print("   ✅ Playwright 真点击 wrapper")
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    print(f"   ℹ️  Playwright 兜底跳过: {e}")
+
+                # 等弹窗动画显示
+                await asyncio.sleep(4)
+                # 3) 处理原创权益弹窗（用 page 查找，因为弹窗可能在主 frame）
+            try:
+                # 先在 page 上找弹窗
+                dialog_in_page = page.locator('.weui-desktop-dialog:has-text("原创权益")').first
+                dialog_in_frame = target.locator('.weui-desktop-dialog:has-text("原创权益")').first
+                dialog = dialog_in_page if await dialog_in_page.count() > 0 else dialog_in_frame
+
+                # 直接定位弹窗内 checkbox wrapper（Playwright 真点击）
+                try:
+                    agree_wrapper = dialog.locator('.ant-checkbox-wrapper').first
+                    if await agree_wrapper.count() > 0:
+                        await agree_wrapper.scroll_into_view_if_needed(timeout=3000)
+                        await agree_wrapper.click(force=True, timeout=3000)
+                        print("   ✅ 已勾选原创声明协议")
+                        await asyncio.sleep(1.5)
+                    else:
+                        print("   ⚠️  未找到协议 checkbox")
+                except Exception as e:
+                    print(f"   ⚠️ 勾选协议失败: {e}")
+
+                # 等按钮变可用，再点确认
+                try:
+                    confirm = dialog.locator(
+                        '.weui-desktop-dialog__ft .weui-desktop-btn_primary:has-text("声明原创")'
+                    ).first
+                    # 等到按钮不是 disabled
+                    for _ in range(20):
+                        disabled = await confirm.evaluate(
+                            "el => el.disabled || el.classList.contains('weui-desktop-btn_disabled') || el.getAttribute('disabled') !== null"
+                        )
+                        if not disabled:
+                            break
+                        await asyncio.sleep(0.5)
+                    await confirm.click(timeout=5000)
+                    print("   ✅ 已点击声明原创确认按钮")
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    print(f"   ⚠️ 确认按钮失败: {e}")
+
+                # 等弹窗关闭
+                try:
+                    await dialog.wait_for(state="hidden", timeout=8000)
+                except Exception:
+                    pass
+
+            except Exception as e:
+                print(f"   ⚠️ 处理弹窗异常: {e}")
+
+            # 4) 最终探测
+            final = await target.evaluate(
+                """
+                () => {
+                    const labels = document.querySelectorAll('.label.with-tip-label, .label');
+                    for (const lbl of labels) {
+                        if ((lbl.innerText || '').trim() === '声明原创') {
+                            const formItem = lbl.closest('.form-item');
+                            if (formItem) {
+                                const cb = formItem.querySelector('.ant-checkbox-input');
+                                if (cb) {
+                                    return cb.checked || cb.getAttribute('aria-checked') === 'true';
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                }
+                """
+            )
+            print(f"   🔍 最终: {'✅原创声明已勾选' if final else '❌原创声明未勾选'}")
+            if not final:
+                await page.screenshot(
+                    path=str(logs_dir / f"original-final-{stamp}.png"),
+                    full_page=True,
+                )
+
+        except Exception as e:
+            print(f"   ❌ 原创声明异常: {e}")
+            try:
+                await page.screenshot(
+                    path=str(logs_dir / f"original-error-{stamp}.png"),
+                    full_page=True,
+                )
+            except Exception:
+                pass
+
+    async def _upload_cover(self, page: Page):
+        """上传自定义封面。每步真实探测 + 截图。"""
+        if not self.cover_path:
+            return False
+        logs_dir = Path(__file__).parent.parent / "logs"
+        logs_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        try:
+            # 1) 点"封面预览"右侧"编辑"链接（force click 避免被遮挡）
+            edit_selectors = [
+                'div[class*="cover"] >> text=编辑',
+                'span:has-text("编辑"):near(:text("封面预览"))',
+                'a:has-text("编辑")',
+                'button:has-text("编辑封面")',
+                'text=设置封面', 'text=编辑封面', 'text=更换封面',
+            ]
+            clicked = False
+            for sel in edit_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        # 用 force click 避免被其他元素遮挡
+                        await btn.click(force=True, timeout=3000)
+                        clicked = True
+                        print(f"   已点封面编辑按钮（{sel}）")
+                        break
+                except Exception as e:
+                    continue
+            if not clicked:
+                print("   ❌ 未找到'编辑'按钮")
+                await page.screenshot(path=str(logs_dir / f"cover-noedit-{stamp}.png"), full_page=True)
+                return False
+
+            await asyncio.sleep(2)
+
+            # 2) modal 出来后，可能要先点"上传封面"/"本地上传"按钮激活 file input
+            upload_triggers = [
+                'text=上传封面', 'text=本地上传', 'text=上传图片',
+                'button:has-text("上传")', 'a:has-text("上传")',
+            ]
+            for sel in upload_triggers:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(force=True, timeout=2000)
+                        print(f"   已点上传触发按钮（{sel}）")
+                        await asyncio.sleep(1)
+                        break
+                except Exception:
+                    continue
+
+            # 3) 找 file input 上传
+            input_selectors = [
+                'input[type="file"][accept*="image"]',
+                'input[type="file"][accept*="jpg"]',
+                'input[type="file"][accept*="png"]',
+                'input[type="file"][accept="image/*"]',
+                'input[type="file"][accept*="jpeg"]',
+            ]
+            uploaded = False
+            for sel in input_selectors:
+                try:
+                    inp = page.locator(sel).first
+                    if await inp.count() == 0:
+                        continue
+                    await inp.set_input_files(str(self.cover_path))
+                    uploaded = True
+                    print(f"   ✅ 封面上传 set_input_files 成功（{sel}）")
+                    break
+                except Exception as e:
+                    print(f"   封面 input {sel} 失败：{e}")
+                    continue
+
+            if not uploaded:
+                print("   ❌ 封面上传失败：所有 file input 都不可用")
+                await page.screenshot(path=str(logs_dir / f"cover-nofileinput-{stamp}.png"), full_page=True)
+                return False
+
+            # 4) 等视频号处理图片 + 真实探测
+            await asyncio.sleep(3)
+
+            # 探测：封面预览区域的 img 元素 src 是不是变成新图片（不是视频截帧）
+            cover_state = await page.evaluate("""
+                () => {
+                    // 找"封面预览"附近所有 img
+                    const labels = Array.from(document.querySelectorAll('*'));
+                    let coverArea = null;
+                    for (const el of labels) {
+                        if (el.children.length === 0 && (el.innerText || '').trim() === '封面预览') {
+                            coverArea = el.parentElement;
+                            break;
+                        }
+                    }
+                    const imgs = coverArea ? coverArea.querySelectorAll('img') : document.querySelectorAll('img[class*="cover"], img[class*="poster"]');
+                    const result = [];
+                    for (const img of imgs) {
+                        result.push({
+                            src: img.src ? img.src.slice(-60) : '',
+                            w: img.naturalWidth || img.width,
+                            h: img.naturalHeight || img.height,
+                        });
+                    }
+                    return result;
+                }
+            """)
+            print(f"   🔍 封面预览 img 探测: {cover_state}")
+
+            # 截图让老K看效果
+            await page.screenshot(path=str(logs_dir / f"cover-after-{stamp}.png"), full_page=True)
+            print(f"   📸 截图保存: cover-after-{stamp}.png")
+
+            # 关闭封面编辑 modal（如果有）
+            close_selectors = [
+                'button:has-text("完成")',
+                'button:has-text("确定")',
+                'button:has-text("确认")',
+                'button:has-text("保存")',
+                '.weui-desktop-dialog__close-btn',
+                '[aria-label="关闭"]',
+            ]
+            for sel in close_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(force=True, timeout=2000)
+                        await asyncio.sleep(0.5)
+                        break
+                except Exception:
+                    continue
+
+            # 判断是否真的换封面了：9:16 比例的图（width/height ≈ 0.5625）
+            ok = any(
+                img.get('w') and img.get('h') and 0.5 < img['w'] / img['h'] < 0.6
+                for img in cover_state
+            )
+            if ok:
+                print(f"   ✅ 封面比例 9:16 确认（{self.cover_path.name} 已生效）")
+                return True
+            else:
+                print(f"   ⚠️  封面比例异常，可能仍是视频截帧（看 cover-after-{stamp}.png 确认）")
+                return False
+
+        except Exception as e:
+            print(f"   ❌ 封面上传异常：{e}")
+            try:
+                await page.screenshot(path=str(logs_dir / f"cover-error-{stamp}.png"), full_page=True)
+            except Exception:
+                pass
+            return False
+
+    async def _mark_ai_content(self, page: Page):
+        """勾选"含 AI 生成内容"视频标注。
+
+        视频号的"视频标注"区域默认是折叠的，需要先点开折叠区。
+        AI标注 div 用 div 模拟 checkbox，必须用 JS click + mouse 事件序列才能触发状态变化。
+        勾选成功后 className 包含 is-selected。
+        """
+        logs_dir = Path(__file__).parent.parent / "logs"
+        logs_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        try:
+            # 定位目标 frame
+            frame = None
+            for f in page.frames:
+                if "micro/content/post/create" in f.url:
+                    frame = f
+                    break
+            if not frame:
+                print("   ❌ 未找到视频号发布 iframe，AI 标注跳过")
+                return False
+
+            target = frame
+
+            # 1) 探测当前是否已勾选（含 AI 生成内容）
+            initial_state = await target.evaluate(
+                """
+                () => {
+                    const opts = document.querySelectorAll('.mark-tag-option, .option-main');
+                    for (const el of opts) {
+                        const txt = (el.innerText || '').trim();
+                        if (txt.includes('含AI') || txt.includes('含 AI 生成') || txt === '含AI生成内容') {
+                            const cls = (el.className || '').toString();
+                            const ariaChecked = el.getAttribute('aria-checked');
+                            const hasCheckedClass = cls.includes('checked');
+                            return {
+                                found: true,
+                                text: txt,
+                                cls: cls,
+                                hasChecked: hasCheckedClass || ariaChecked === 'true',
+                            };
+                        }
+                    }
+                    return {found: false};
+                }
+                """
+            )
+
+            if initial_state.get("found") and initial_state.get("hasChecked"):
+                print(f"   ✅ AI 标注已勾选（{initial_state.get('text', '')}）")
+                return True
+
+            # 2) 展开"视频标注"折叠区（如果还没展开）
+            try:
+                expand_candidates = [
+                    'label:has-text("视频标注")',
+                    'span:has-text("视频标注")',
+                    'div:has-text("视频标注")',
+                    '[class*="mark-tag"]:has-text("视频标注")',
+                    '[class*="video-mark"]',
+                ]
+                for sel in expand_candidates:
+                    loc = target.locator(sel).first
+                    if await loc.count() > 0:
+                        try:
+                            await loc.click(timeout=2000)
+                            print(f"   已展开视频标注区域（{sel}）")
+                            await asyncio.sleep(1.5)
+                            break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            # 3) 找"含 AI 生成内容"选项并点选
+            clicked = await target.evaluate(
+                """
+                () => {
+                    // 候选 1：.mark-tag-option 包含"含AI"文字
+                    const cands = document.querySelectorAll('.mark-tag-option, .option-main');
+                    for (const el of cands) {
+                        const txt = (el.innerText || '').trim();
+                        if (txt.includes('含AI') || txt === '含AI生成内容' || txt === '含 AI 生成内容') {
+                            el.scrollIntoView({block: 'center'});
+                            el.click();
+                            return {text: txt, cls: el.className};
+                        }
+                    }
+                    // 候选 2：用文字匹配所有可见 div
+                    const allDivs = document.querySelectorAll('div, label, span');
+                    for (const el of allDivs) {
+                        const txt = (el.innerText || '').trim();
+                        if (txt === '含AI生成内容' || txt === '含 AI 生成内容') {
+                            el.scrollIntoView({block: 'center'});
+                            el.click();
+                            return {text: txt, cls: el.className};
+                        }
+                    }
+                    return null;
+                }
+                """
+            )
+            if clicked:
+                print(f"   ✅ 已点击含 AI 生成内容选项（{clicked.get('text')}）")
+            else:
+                print("   ⚠️  未找到含 AI 生成内容选项")
+            await asyncio.sleep(2)
+
+            # 4) 兜底：用 React 合成事件强制勾选 + 多次重试
+            final_state = {"found": False, "hasChecked": False, "text": ""}
+            for attempt in range(3):
+                final_state = await target.evaluate(
+                    """
+                    () => {
+                        const opts = document.querySelectorAll('.mark-tag-option, .option-main');
+                        for (const el of opts) {
+                            const txt = (el.innerText || '').trim();
+                            if (txt.includes('含AI') || txt === '含AI生成内容') {
+                                const cls = (el.className || '').toString();
+                                return {
+                                    found: true,
+                                    text: txt,
+                                    hasChecked: cls.includes('checked') || cls.includes('active') || cls.includes('is-selected'),
+                                    cls: cls,
+                                };
+                            }
+                        }
+                        return {found: false};
+                    }
+                    """
+                )
+                if final_state.get("hasChecked"):
+                    break
+
+                try:
+                    await target.evaluate(
+                        """
+                        () => {
+                            const opts = document.querySelectorAll('.mark-tag-option, .option-main');
+                            for (const el of opts) {
+                                const txt = (el.innerText || '').trim();
+                                if (txt.includes('含AI') || txt === '含AI生成内容') {
+                                    el.scrollIntoView({block: 'center'});
+                                    const rect = el.getBoundingClientRect();
+                                    const cx = rect.left + rect.width / 2;
+                                    const cy = rect.top + rect.height / 2;
+                                    ['mouseenter', 'mouseover', 'mousedown', 'focus', 'mouseup', 'click'].forEach(t => {
+                                        el.dispatchEvent(new MouseEvent(t, {
+                                            bubbles: true, cancelable: true,
+                                            view: window, clientX: cx, clientY: cy, button: 0,
+                                        }));
+                                    });
+                                    el.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }
+                        """
+                    )
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+
+            if final_state.get("found") and final_state.get("hasChecked"):
+                print(f"   ✅ AI 标注已勾选（{final_state.get('text', '')}）")
+                return True
+            else:
+                print(f"   ❌ AI 标注未勾上（state={final_state}）")
+                await page.screenshot(
+                    path=str(logs_dir / f"ai-notchecked-{stamp}.png"),
+                    full_page=True,
+                )
+                return False
+        except Exception as e:
+            print(f"   ❌ AI 标注异常: {e}")
+            try:
+                await page.screenshot(
+                    path=str(logs_dir / f"ai-error-{stamp}.png"),
+                    full_page=True,
+                )
+            except Exception:
+                pass
+            return False
+
+    async def _wait_for_upload_complete(self, page: Page):
+        max_attempts = 120
+        for i in range(max_attempts):
+            try:
+                publish_btn = page.get_by_role("button", name="发表")
+                cnt = await publish_btn.count()
+                if cnt == 0:
+                    if i % 10 == 0:
+                        print(f"   正在上传... ({i}s)")
+                    await asyncio.sleep(1)
+                    continue
+                cls = await publish_btn.get_attribute('class')
+                if cls and "weui-desktop-btn_disabled" not in cls:
+                    print("   视频上传完成")
+                    return
+                if i % 10 == 0:
+                    print(f"   正在上传... ({i}s)")
+                await asyncio.sleep(1)
+            except Exception:
+                await asyncio.sleep(1)
+        raise TimeoutError("视频上传超时")
+
+    async def _set_schedule_time(self, page: Page):
+        try:
+            label_element = page.locator("label").filter(has_text="定时").nth(1)
+            await label_element.click()
+        except Exception:
+            try:
+                await page.locator('text=定时发布').first.click()
+            except Exception:
+                return
+
+        await asyncio.sleep(0.5)
+        try:
+            await page.click('input[placeholder="请选择发表时间"]')
+            elements = await page.query_selector_all('table.weui-desktop-picker__table a')
+            for element in elements:
+                cls = await element.evaluate('el => el.className')
+                if 'weui-desktop-picker__disabled' in cls:
+                    continue
+                text = await element.inner_text()
+                if text.strip() == str(self.schedule_time.day):
+                    await element.click()
+                    break
+            await page.click('input[placeholder="请选择时间"]')
+            await page.keyboard.press("Control+KeyA")
+            await page.keyboard.type(str(self.schedule_time.hour))
+            await page.locator("div.input-editor").click()
+        except Exception as e:
+            print(f"   定时设置失败: {e}")
+
+    async def _add_short_title(self, page: Page):
+        try:
+            short_title_element = page.get_by_text("短标题", exact=True).locator("..").locator(
+                "xpath=following-sibling::div").locator('span input[type="text"]')
+            if await short_title_element.count():
+                short_title = self.title[:14].strip()
+                if len(short_title) < 6:
+                    short_title = (self.title + "    ")[:6]
+                await short_title_element.fill(short_title)
+                print(f"   已填短标题: {short_title}")
+        except Exception:
+            pass
+
+    async def _publish(self, page: Page):
+        if self.skip_publish:
+            # 调试模式：不点发表按钮，截图 + 探测关键 checkbox 状态
+            try:
+                logs_dir = Path(__file__).parent.parent / "logs"
+                logs_dir.mkdir(exist_ok=True)
+                stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                shot = logs_dir / f"skip-publish-{stamp}.png"
+                await page.screenshot(path=str(shot), full_page=True)
+                print(f"   截图保存: {shot}")
+            except Exception as e:
+                print(f"   截图失败: {e}")
+            # 探测关键勾选状态（写到日志，不用打开浏览器也能确认）
+            try:
+                # 找视频号 iframe
+                frame = None
+                for f in page.frames:
+                    if 'micro/content/post/create' in f.url:
+                        frame = f
+                        break
+                target = frame if frame else page
+                checks = await target.evaluate("""
+                    () => {
+                        const out = {};
+                        // 原创声明
+                        const origLabels = document.querySelectorAll('label, span, div');
+                        for (const el of origLabels) {
+                            const t = (el.innerText || '').trim();
+                            if (t === '声明原创' || t === '原创') {
+                                let cb = el.parentElement && el.parentElement.querySelector('input[type=checkbox]');
+                                if (!cb) cb = el.closest('label') && el.closest('label').querySelector('input[type=checkbox]');
+                                if (cb) out['原创声明'] = cb.checked;
+                            }
+                        }
+                        // AI 标注（递归 Shadow DOM）
+                        const walk = (root) => {
+                            const candidates = root.querySelectorAll('.mark-tag-option');
+                            for (const el of candidates) {
+                                const txt = (el.innerText || '').trim();
+                                if (txt.includes('含AI') || txt.includes('AI 生成')) {
+                                    out['AI标注'] = !!el.querySelector('input[type=checkbox]:checked, .checked, [class*="checked"], [class*="is-selected"]') ||
+                                                    el.className.includes('checked') ||
+                                                    el.className.includes('is-selected') ||
+                                                    el.className.includes('active') ||
+                                                    el.getAttribute('aria-checked') === 'true';
+                                    return;
+                                }
+                            }
+                            const c2 = root.querySelectorAll('.option-main');
+                            for (const el of c2) {
+                                const txt = (el.innerText || '').trim();
+                                if (txt === '含AI生成内容' || txt === '含 AI 生成内容') {
+                                    out['AI标注'] = el.className.includes('checked') || el.className.includes('is-selected') || el.className.includes('active');
+                                    return;
+                                }
+                            }
+                            for (const el of root.querySelectorAll('*')) {
+                                if (el.shadowRoot) walk(el.shadowRoot);
+                            }
+                        };
+                        walk(document);
+                        return out;
+                    }
+                """)
+                print(f"   📋 勾选状态探测: {checks}")
+            except Exception as e:
+                print(f"   勾选探测失败：{e}")
+            print("   ⏸️  跳过发布（保留页面，可去视频号草稿箱/创作页确认）")
+            return
+
+        for attempt in range(30):
+            try:
+                if self.is_draft:
+                    draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
+                    if await draft_button.count():
+                        await draft_button.first.click()
+                    await page.wait_for_url("**/post/list**", timeout=5000)
+                    return
+                else:
+                    publish_button = page.locator('div.form-btns button:has-text("发表")')
+                    if await publish_button.count():
+                        await publish_button.first.click()
+                    await page.wait_for_url("https://channels.weixin.qq.com/platform/post/list", timeout=5000)
+                    return
+            except Exception:
+                await asyncio.sleep(1)
+        raise TimeoutError("发布超时")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="微信视频号自动发布")
+    parser.add_argument("-v", "--video", required=True, help="视频文件路径")
+    parser.add_argument("-t", "--title", required=True, help="视频标题")
+    parser.add_argument("-g", "--tags", default="", help="话题标签，逗号分隔")
+    parser.add_argument("-o", "--original", action="store_true", help="声明原创")
+    parser.add_argument("-c", "--category", default=None, help="原创类型")
+    parser.add_argument("-s", "--schedule", default=None, help="定时发布时间 YYYY-MM-DD HH:MM")
+    parser.add_argument("--draft", action="store_true", help="保存为草稿")
+    parser.add_argument("--headless", action="store_true", help="无头模式")
+    parser.add_argument("--cover", default=None, help="封面图片路径（JPG/PNG）")
+    parser.add_argument("--mark-ai", action="store_true", help="勾选'标注含 AI 生成内容'")
+    parser.add_argument("--skip-publish", action="store_true", help="调试模式：跑完所有步骤但不点发表（截图保存）")
+    parser.add_argument("--keep-browser", type=int, default=0, metavar="SEC", help="跑完后保留浏览器 N 秒（默认 0=立即关）")
+    parser.add_argument("--manual-finish", action="store_true", help="半自动模式：跑完视频+封面+标题+短标题后保留浏览器，老K手动勾原创/AI/发表")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    # 话题可能用逗号或空格分隔，且可能带 # 前缀
+    raw_tags = args.tags.replace(",", " ").split() if args.tags else []
+    tags = [t.lstrip("#").strip() for t in raw_tags if t.strip()]
+    schedule_time = None
+    if args.schedule:
+        try:
+            schedule_time = datetime.strptime(args.schedule, "%Y-%m-%d %H:%M")
+        except ValueError:
+            print("❌ 时间格式错误，应为 YYYY-MM-DD HH:MM")
+            sys.exit(1)
+    try:
+        uploader = WeixinVideoUploader(
+            video_path=args.video,
+            title=args.title,
+            tags=tags,
+            original=args.original,
+            category=args.category,
+            schedule_time=schedule_time,
+            is_draft=args.draft,
+            headless=args.headless,
+            cover_path=args.cover,
+            mark_ai=args.mark_ai,
+            skip_publish=args.skip_publish,
+            keep_browser=args.keep_browser,
+            manual_finish=args.manual_finish,
+        )
+        success = asyncio.run(uploader.upload())
+        sys.exit(0 if success else 1)
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
