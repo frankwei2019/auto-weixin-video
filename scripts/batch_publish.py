@@ -76,7 +76,7 @@ def mark_published(rows: list[dict], video_file: str) -> None:
             return
 
 
-def publish_one(row: dict, dry_run: bool = False, skip_publish: bool = False, keep_browser: int = 0, manual_finish: bool = False) -> bool:
+def publish_one(row: dict, dry_run: bool = False, skip_publish: bool = False, keep_browser: int = 0, manual_finish: bool = False, no_location: bool = False) -> bool:
     """调用同目录 publish.py 发布一条视频。返回是否成功。"""
     video_file = row["video_file"].strip()
     title = row["title"].strip()
@@ -117,6 +117,8 @@ def publish_one(row: dict, dry_run: bool = False, skip_publish: bool = False, ke
         cmd += ["--manual-finish"]
         if keep_browser == 0:
             cmd += ["--keep-browser", "300"]  # manual-finish 默认 5 分钟
+    if no_location:
+        cmd += ["--no-location"]
 
     print()
     print("=" * 60)
@@ -151,6 +153,7 @@ def main():
     parser.add_argument("--keep-browser", type=int, default=0, metavar="SEC", help="跑完后保留浏览器 N 秒（默认 0=立即关）")
     parser.add_argument("--manual-finish", action="store_true", help="半自动模式：跑完自动部分后保留浏览器，老K手动勾原创/AI/发表")
     parser.add_argument("--ignore-time", action="store_true", help="忽略定时时间过滤（提前上传+设定时发布，常和 pending 重发一起用）")
+    parser.add_argument("--no-location", action="store_true", help="不显示位置（清空'广州市'等默认位置）")
     parser.add_argument("--max-count", type=int, default=0, metavar="N", help="最多发布 N 条（0=不限制）")
     args = parser.parse_args()
 
@@ -195,7 +198,7 @@ def main():
             print(f"\n{'='*60}")
             print(f"📺 第 {i}/{len(targets)} 个：{r['video_file']}")
             print(f"{'='*60}")
-        ok = publish_one(r, dry_run=args.dry_run, skip_publish=args.skip_publish, keep_browser=args.keep_browser, manual_finish=args.manual_finish)
+        ok = publish_one(r, dry_run=args.dry_run, skip_publish=args.skip_publish, keep_browser=args.keep_browser, manual_finish=args.manual_finish, no_location=args.no_location)
         if ok:
             # dry-run / skip-publish 都不该改 CSV
             if not args.dry_run and not args.skip_publish:

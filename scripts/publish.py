@@ -37,6 +37,7 @@ class WeixinVideoUploader:
         skip_publish: bool = False,
         keep_browser: int = 0,
         manual_finish: bool = False,
+        no_location: bool = False,
     ):
         self.video_path = Path(video_path)
         self.title = title
@@ -51,6 +52,7 @@ class WeixinVideoUploader:
         self.skip_publish = skip_publish
         self.keep_browser = keep_browser
         self.manual_finish = manual_finish  # 半自动模式：跑完自动部分后老K手动勾原创/AI/发表
+        self.no_location = no_location  # 不显示位置（清空'广州市'等默认位置）
 
         if not self.video_path.exists():
             raise FileNotFoundError(f"视频文件不存在: {self.video_path}")
@@ -204,6 +206,10 @@ class WeixinVideoUploader:
 
                 print("[7/9] 等待视频上传完成...")
                 await self._wait_for_upload_complete(page)
+
+                if self.no_location:
+                    print("[7.5/9] 清空位置字段...")
+                    await self._clear_location(page)
 
                 print("[8/9] 上传自定义封面...")
                 await self._upload_cover(page)
@@ -1096,6 +1102,186 @@ class WeixinVideoUploader:
         except Exception as e:
             print(f"   ❌ 定时设置失败: {e}")
 
+    async def _clear_location(self, page: Page):
+        """清空位置字段（视频号默认填'广州市'等创作者 profile 城市）。
+        视频号位置字段结构：
+        - 默认显示成 select（带城市名 + ▼ 箭头）
+        - 点击 select 弹搜索框变成 input[placeholder='搜索附近位置']
+        策略：找 select/Ant Design Select，尝试选空选项；找不到则直接调 React 把它清空。
+        """
+        try:
+            frame = None
+            for f in page.frames:
+                if "micro/content/post/create" in f.url:
+                    frame = f
+                    break
+            target = frame if frame else page
+
+            # 1) 先尝试找 select-like 容器（Ant Design 的 .ant-select-selection-item 含城市名）
+            # 2) 点击它打开 dropdown
+            # 3) 找"不显示位置"或空选项
+            # 4) 没有的话：清空 input value + 触发 change
+            result = await target.evaluate("""
+            () => {
+                // 找位置字段（label='位置'）
+                const labels = document.querySelectorAll('.form-item__label, .weui-desktop-form__label, label, span');
+                let locationLabel = null;
+                for (const lbl of labels) {
+                    if ((lbl.innerText || '').trim() === '位置') {
+                        locationLabel = lbl;
+                        break;
+                    }
+                }
+                if (!locationLabel) return {found: false, reason: 'no 位置 label'};
+
+                // 找最近的 form-item 容器
+                let container = locationLabel;
+                for (let i = 0; i < 5; i++) {
+                    if (container.parentElement) container = container.parentElement;
+                }
+
+                // 找 select 元素（Ant Design）
+                const select = container.querySelector('.ant-select, [class*=ant-select], select, [class*=Select]');
+
+                // 找搜索输入框
+                const searchInput = container.querySelector('input[placeholder=\"搜索附近位置\"]');
+
+                return {
+                    found: true,
+                    hasSelect: !!select,
+                    hasInput: !!searchInput,
+                    containerText: (container.innerText || '').trim().substring(0, 100),
+                    containerHTML: container.outerHTML.substring(0, 600),
+                };
+            }
+            """)
+
+            if not result.get('found'):
+                print(f"   ⚠️  未找到位置字段: {result.get('reason')}")
+                return
+
+            # 策略 A：点击 select 打开 dropdown，找"不显示位置"或空 option
+            clicked_dropdown = await target.evaluate("""
+            () => {
+                const labels = document.querySelectorAll('.form-item__label, .weui-desktop-form__label, label, span');
+                let locationLabel = null;
+                for (const lbl of labels) {
+                    if ((lbl.innerText || '').trim() === '位置') {
+                        locationLabel = lbl;
+                        break;
+                    }
+                }
+                if (!locationLabel) return {clicked: false};
+                let container = locationLabel;
+                for (let i = 0; i < 5; i++) {
+                    if (container.parentElement) container = container.parentElement;
+                }
+                const select = container.querySelector('.ant-select, [class*=ant-select], select');
+                if (select) {
+                    select.click();
+                    return {clicked: true, type: 'select'};
+                }
+                const inp = container.querySelector('input[placeholder=\"搜索附近位置\"]');
+                if (inp) {
+                    inp.click();
+                    return {clicked: true, type: 'input'};
+                }
+                return {clicked: false};
+            }
+            """)
+            await asyncio.sleep(1.0)
+
+            # 查找"不显示位置"或空选项
+            empty_option = await target.evaluate("""
+            () => {
+                // dropdown 里的所有选项
+                const dropdowns = document.querySelectorAll('.ant-select-dropdown, [class*=dropdown], [class*=Dropdown]');
+                const keywords = ['不显示', '不选择', '无', '无位置', '暂不', '清空'];
+                for (const dd of dropdowns) {
+                    if (dd.offsetParent === null) continue;  // 跳过隐藏
+                    const opts = dd.querySelectorAll('li, [class*=item], [class*=Option]');
+                    for (const opt of opts) {
+                        const t = (opt.innerText || '').trim();
+                        for (const k of keywords) {
+                            if (t.includes(k)) {
+                                return {found: true, text: t, selector: 'li'};
+                            }
+                        }
+                    }
+                }
+                return {found: false};
+            }
+            """)
+
+            if empty_option.get('found'):
+                # 找到空选项，点击
+                await target.evaluate(f"""
+                () => {{
+                    const dropdowns = document.querySelectorAll('.ant-select-dropdown, [class*=dropdown]');
+                    const keywords = ['不显示', '不选择', '无', '无位置', '暂不', '清空'];
+                    for (const dd of dropdowns) {{
+                        if (dd.offsetParent === null) continue;
+                        const opts = dd.querySelectorAll('li, [class*=item]');
+                        for (const opt of opts) {{
+                            const t = (opt.innerText || '').trim();
+                            for (const k of keywords) {{
+                                if (t.includes(k)) {{
+                                    opt.click();
+                                    return;
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+                """)
+                print(f"   ✅ 已点击 '{empty_option.get('text')}' 关闭位置显示")
+                return
+
+            # 策略 B：没有空选项，用 Ant Design 方式清空（hover → close icon）
+            # 找位置字段里的 close icon
+            cleared = await target.evaluate("""
+            () => {
+                const labels = document.querySelectorAll('.form-item__label, .weui-desktop-form__label, label, span');
+                let locationLabel = null;
+                for (const lbl of labels) {
+                    if ((lbl.innerText || '').trim() === '位置') {
+                        locationLabel = lbl;
+                        break;
+                    }
+                }
+                if (!locationLabel) return {cleared: false};
+                let container = locationLabel;
+                for (let i = 0; i < 5; i++) {
+                    if (container.parentElement) container = container.parentElement;
+                }
+
+                // 找 close icon (ant-select-clear)
+                const clearIcon = container.querySelector('.ant-select-clear, [class*=clear]');
+                if (clearIcon) {
+                    clearIcon.click();
+                    return {cleared: true, method: 'clear-icon'};
+                }
+
+                // 找 input 看 placeholder 是不是搜索附近位置
+                const inp = container.querySelector('input[placeholder=\"搜索附近位置\"]');
+                if (inp) {
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(inp, '');
+                    inp.dispatchEvent(new Event('input', {bubbles: true}));
+                    inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    inp.dispatchEvent(new Event('blur', {bubbles: true}));
+                    return {cleared: true, method: 'input-clear'};
+                }
+                return {cleared: false};
+            }
+            """)
+            if cleared.get('cleared'):
+                print(f"   ✅ 已清空位置字段（{cleared.get('method')}）")
+            else:
+                print(f"   ⚠️  位置清空失败：没找到清空按钮或空选项")
+        except Exception as e:
+            print(f"   ❌ 清空位置失败: {e}")
+
     async def _add_short_title(self, page: Page):
         try:
             short_title_element = page.get_by_text("短标题", exact=True).locator("..").locator(
@@ -1213,6 +1399,7 @@ def parse_args():
     parser.add_argument("--skip-publish", action="store_true", help="调试模式：跑完所有步骤但不点发表（截图保存）")
     parser.add_argument("--keep-browser", type=int, default=0, metavar="SEC", help="跑完后保留浏览器 N 秒（默认 0=立即关）")
     parser.add_argument("--manual-finish", action="store_true", help="半自动模式：跑完视频+封面+标题+短标题后保留浏览器，老K手动勾原创/AI/发表")
+    parser.add_argument("--no-location", action="store_true", help="不显示位置（清空位置字段，避免默认显示'广州市'）")
     return parser.parse_args()
 
 
@@ -1243,6 +1430,7 @@ def main():
             skip_publish=args.skip_publish,
             keep_browser=args.keep_browser,
             manual_finish=args.manual_finish,
+            no_location=args.no_location,
         )
         success = asyncio.run(uploader.upload())
         sys.exit(0 if success else 1)
