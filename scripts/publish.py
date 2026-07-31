@@ -1017,27 +1017,68 @@ class WeixinVideoUploader:
 
             await asyncio.sleep(1)
 
-            # 5) 用 React setter 改时间（placeholder="请选择时间"）
+            # 5) 用 Playwright 真点击 + 键盘输入（视频号时间 picker 是 React 18 自定义组件，
+            #    dispatchEvent('input') 不会触发 onChange 同步，必须模拟真实键盘输入）
             time_str = f"{target_hour:02d}:{target_minute:02d}"
             try:
-                time_result = await target.evaluate(f"""
+                # 5a) JS click 触发 picker 的 input 聚焦（picker 也是个 React 组件）
+                await target.evaluate(f"""
                 () => {{
                     const inp = document.querySelector('input[placeholder="请选择时间"]');
-                    if (!inp) return {{set: false, reason: 'not found'}};
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    setter.call(inp, '{time_str}');
-                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
-                    return {{set: true, newVal: inp.value}};
+                    if (!inp) return;
+                    inp.focus();
+                    inp.click();
                 }}
                 """)
-                if time_result.get('set'):
-                    print(f"   ✅ 已填时间: {time_result.get('newVal')}")
+                await asyncio.sleep(0.5)
+
+                # 5b) 用 Playwright 真点击 input（force 避开 readonly 检查）
+                time_input = target.locator('input[placeholder="请选择时间"]')
+                if await time_input.count() > 0:
+                    await time_input.click(force=True, timeout=5000)
+                    await asyncio.sleep(0.3)
+
+                    # 5c) 全选 + 删除 + 真实键盘输入（发到 target frame）
+                    await target.keyboard.press('Control+A')
+                    await target.keyboard.press('Delete')
+                    await asyncio.sleep(0.2)
+                    await target.keyboard.type(time_str, delay=120)
+                    await asyncio.sleep(0.5)
+
+                    # 5d) blur 触发提交（Tab 切到下一个 form 元素）
+                    await target.keyboard.press('Tab')
+                    await asyncio.sleep(0.5)
+
+                    # 5e) 验证
+                    actual_time = await target.evaluate(f"""
+                    () => {{
+                        const inp = document.querySelector('input[placeholder="请选择时间"]');
+                        return inp ? inp.value : '';
+                    }}
+                    """)
+                    print(f"   ✅ 已填时间: {actual_time}（目标 {time_str}）")
                 else:
                     print(f"   ⚠️  未找到时间 input")
             except Exception as e:
                 print(f"   ⚠️  填时间失败: {e}")
+                # fallback: 旧 JS 写法
+                try:
+                    time_result = await target.evaluate(f"""
+                    () => {{
+                        const inp = document.querySelector('input[placeholder="请选择时间"]');
+                        if (!inp) return {{set: false, reason: 'not found'}};
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(inp, '{time_str}');
+                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                        return {{set: true, newVal: inp.value}};
+                    }}
+                    """)
+                    if time_result.get('set'):
+                        print(f"   ⚠️  fallback 写入: {time_result.get('newVal')}（可能未生效）")
+                except Exception as e2:
+                    print(f"   ❌ fallback 也失败: {e2}")
 
             await asyncio.sleep(1)
 
