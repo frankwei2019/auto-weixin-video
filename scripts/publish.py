@@ -19,6 +19,7 @@ except ImportError:
 
 COOKIE_DIR = Path(__file__).parent.parent / "cookies"
 COOKIE_FILE = COOKIE_DIR / "weixin_video.json"
+BROWSER_DATA_DIR = Path(__file__).parent.parent / "browser_data"
 
 
 class WeixinVideoUploader:
@@ -78,10 +79,15 @@ class WeixinVideoUploader:
             return False
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.headless)
+            # 用 launch_persistent_context 共享 browser_data 里的 session，
+            # 否则 storage_state 里只有 2 个 cookie 不够被视频号识别
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(BROWSER_DATA_DIR),
+                headless=self.headless,
+                no_viewport=True,
+            )
+            page = context.pages[0] if context.pages else await context.new_page()
             try:
-                context = await browser.new_context(storage_state=str(COOKIE_FILE))
-                page = await context.new_page()
 
                 print("[1/7] 打开视频号创作者中心...")
                 await page.goto(
@@ -195,7 +201,7 @@ class WeixinVideoUploader:
                     print(f"⏸️  浏览器保留 {self.keep_browser} 秒，老K手动操作...")
                     # 先存 cookie（浏览器关了就存不了）
                     await context.storage_state(path=str(COOKIE_FILE))
-                    await self._maybe_keep_browser(browser, page)
+                    await self._maybe_keep_browser(context, page)
                     return True
 
                 print("[5/7] 声明原创...")
@@ -228,7 +234,7 @@ class WeixinVideoUploader:
                 print("✅ 视频发布成功！")
                 print("=" * 60)
 
-                await self._maybe_keep_browser(browser, page)
+                await self._maybe_keep_browser(context, page)
                 return True
 
             except Exception as e:
@@ -238,10 +244,10 @@ class WeixinVideoUploader:
                 await self._maybe_keep_browser(browser, page)
                 return False
 
-    async def _maybe_keep_browser(self, browser, page=None):
+    async def _maybe_keep_browser(self, context, page=None):
         """跑完后保留浏览器，让老K 可手动操作"""
         if self.keep_browser <= 0 and not self.manual_finish:
-            await browser.close()
+            await context.close()
             return
         print()
         if self.manual_finish:
@@ -277,7 +283,7 @@ class WeixinVideoUploader:
                 await asyncio.sleep(self.keep_browser)
             except asyncio.CancelledError:
                 pass
-        await browser.close()
+        await context.close()
 
     async def _fill_title_and_tags(self, page: Page):
         """关键修复：标题+话题一起填到 div.input-editor（视频号统一富文本编辑器）"""
