@@ -155,6 +155,7 @@ def main():
     parser.add_argument("--ignore-time", action="store_true", help="忽略定时时间过滤（提前上传+设定时发布，常和 pending 重发一起用）")
     parser.add_argument("--no-location", action="store_true", help="不显示位置（清空'广州市'等默认位置）")
     parser.add_argument("--max-count", type=int, default=0, metavar="N", help="最多发布 N 条（0=不限制）")
+    parser.add_argument("--force", action="store_true", help="强制重发（包括 CSV 已 done 的，老K删草稿后用）")
     args = parser.parse_args()
 
     rows = read_schedule()
@@ -165,7 +166,7 @@ def main():
     targets: list[dict] = []
     for r in rows:
         # --file 显式指定时忽略 status（用户明确要发）
-        if not args.file and r.get("status", "").strip() != "pending":
+        if not args.file and not args.force and r.get("status", "").strip() != "pending":
             continue
         if args.file and r["video_file"] != args.file:
             continue
